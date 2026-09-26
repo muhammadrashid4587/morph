@@ -1,0 +1,10 @@
+[project]
+name = "morph-desktop"
+version = "0.1.0"
+description = "MORPH desktop agent: a local, safe WebSocket service that turns validated JSON actions into laptop actions."
+requires-python = ">=3.11"
+dependencies = ["websockets>=13.0,<18"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

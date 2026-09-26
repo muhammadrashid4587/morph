@@ -1,0 +1,9 @@
+# Runtime
+websockets>=13.0,<18
+
+# Tests
+pytest>=8.0
+
+# Optional, only for real desktop control (MORPH_REAL_ACTIONS=1).
+# Not installed by default so mock mode stays dependency-light and safe:
+#   pip install pyautogui
