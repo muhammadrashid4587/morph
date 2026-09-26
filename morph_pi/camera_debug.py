@@ -1,0 +1,433 @@
+"""Live webcam POINT debug viewer (optional; needs OpenCV + MediaPipe).
+
+    python -m morph_pi.camera_debug [--camera 0] [--model PATH] [--config PATH]
+
+Shows the mirrored camera image with the detected hand's 21 landmarks and
+connections, a cyan pointing ray from index MCP (5) through the index
+fingertip (8), and the three target zones. Each frame's ray goes through
+select_target() and one per-session TemporalSmoother (see live_point.py);
+the viewer highlights the candidate / locked target. Debug-only: it controls
+no hardware and sends nothing over the network.
+
+Detection and selection run in the unmirrored camera frame (the space the
+target config uses). Image, landmarks, ray and target zones are all mirrored
+together for display only.
+
+Exit codes: 0 normal quit, 1 camera failure, 2 usage error, 3 missing setup
+(vision packages or model file).
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import sys
+import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from .config import DEFAULT_MIN_RAY_LENGTH
+from .hand_tracking import (
+    HAND_CONNECTIONS,
+    HAND_LANDMARK_COUNT,
+    mirror_ray,
+    ray_exit_point,
+    ray_from_landmarks,
+    ray_rejection_reason,
+)
+from .live_point import PointFrame, PointPipeline, short_name
+from .models import SelectionState, TargetConfig, TargetId
+from .targets import ConfigError, default_config, load_config
+
+MISSING_DEPS_MESSAGE = "Install optional vision dependencies with: pip install -r morph_pi/requirements-vision.txt"
+WINDOW_TITLE = "MORPH POINT Debug"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "hand_landmarker.task"
+MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task"
+)
+
+EXIT_OK, EXIT_CAMERA, EXIT_USAGE, EXIT_SETUP = 0, 1, 2, 3
+MAX_FAILED_READS = 30  # consecutive failed frame reads before giving up
+QUIT_KEYS = frozenset({ord("q"), ord("Q"), 27})  # 27 = Escape
+
+# BGR colors
+CYAN = (255, 255, 0)
+GREEN = (90, 220, 90)
+RED = (70, 70, 240)
+YELLOW = (0, 215, 255)
+WHITE = (245, 245, 245)
+BONE = (200, 200, 200)
+BLACK = (0, 0, 0)
+ORANGE = (0, 165, 255)
+TARGET_COLORS: dict[TargetId, tuple[int, int, int]] = {
+    TargetId.BLUE_BLOCK: (255, 140, 30),
+    TargetId.YELLOW_BLOCK: (0, 225, 255),
+    TargetId.GREEN_BLOCK: (60, 210, 60),
+}
+
+Pixel = tuple[int, int]
+
+
+# --- pure display model (testable without OpenCV) ------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class OverlayModel:
+    hand_detected: bool
+    points: tuple[Pixel | None, ...]  # mirrored pixel positions; None if not drawable
+    finger: tuple[Pixel, Pixel] | None  # landmark 5 -> 8, mirrored
+    ray: tuple[Pixel, Pixel] | None  # landmark 5 -> image border, mirrored
+    note: str | None  # why there is no ray, when a hand is detected
+
+
+def to_pixel(x: float, y: float, width: int, height: int) -> Pixel | None:
+    """Normalized (x, y) -> pixel; None for non-finite values. Off-image values stay drawable."""
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return None
+    px = round(min(2.0, max(-1.0, x)) * (width - 1))
+    py = round(min(2.0, max(-1.0, y)) * (height - 1))
+    return int(px), int(py)
+
+
+def build_overlay(
+    raw: Sequence[tuple[float, float]] | None,
+    width: int,
+    height: int,
+    min_ray_length: float = DEFAULT_MIN_RAY_LENGTH,
+) -> OverlayModel:
+    """Everything to draw for one frame, in mirrored display pixels."""
+    if not raw:
+        return OverlayModel(False, (), None, None, None)
+    points = tuple(to_pixel(1.0 - x, y, width, height) for x, y in raw)
+    ray = ray_from_landmarks(raw, min_ray_length)
+    if ray is None:
+        return OverlayModel(True, points, None, None, ray_rejection_reason(raw, min_ray_length))
+    shown = mirror_ray(ray)
+    end = ray_exit_point(shown)
+
+    def px(p: Any) -> Pixel:
+        pixel = to_pixel(p.x, p.y, width, height)
+        assert pixel is not None  # Point2D is always finite
+        return pixel
+
+    return OverlayModel(True, points, (px(shown.origin), px(shown.through)), (px(shown.origin), px(end)), None)
+
+
+@dataclass(frozen=True, slots=True)
+class TargetZone:
+    id: TargetId
+    name: str  # BLUE / YELLOW / GREEN
+    center: Pixel  # mirrored display pixels
+    axes: Pixel  # ellipse half-axes in pixels
+    color: tuple[int, int, int]
+
+
+def target_zones(config: TargetConfig, width: int, height: int) -> tuple[TargetZone, ...]:
+    """Each target's zone in mirrored display pixels.
+
+    The zone is everything within max_ray_distance of the target center, in
+    normalized units: a target is a valid candidate only if the ray passes
+    through it. Normalized x and y scale by width and height, so the zone is
+    an ellipse in pixels.
+    """
+    axes = (
+        max(1, round(config.max_ray_distance * (width - 1))),
+        max(1, round(config.max_ray_distance * (height - 1))),
+    )
+    zones = []
+    for target in config.targets:
+        center = to_pixel(1.0 - target.center.x, target.center.y, width, height)
+        assert center is not None  # Point2D is always finite
+        zones.append(TargetZone(target.id, short_name(target.id), center, axes, TARGET_COLORS[target.id]))
+    return tuple(zones)
+
+
+def pulse(now: float, hz: float = 2.0) -> float:
+    """0..1, oscillating hz times per second (for the candidate highlight)."""
+    return 0.5 + 0.5 * math.sin(2.0 * math.pi * hz * now)
+
+
+def selection_status(frame: PointFrame) -> tuple[str, tuple[int, int, int]] | None:
+    """Big status line under HAND DETECTED; None when there is no hand (NO HAND is shown already)."""
+    result = frame.result
+    name = short_name(result.target_id) if result is not None and result.target_id is not None else "-"
+    status = frame.status
+    if status == "NO HAND":
+        return None
+    if status == "LOCKED":
+        assert result is not None and result.target_id is not None
+        return f"LOCKED: {name}", TARGET_COLORS[result.target_id]
+    if status == "CANDIDATE":
+        assert result is not None
+        return f"CANDIDATE: {name} {result.confidence:.0%}", WHITE
+    return status, {"NO RAY": YELLOW, "AMBIGUOUS": ORANGE}.get(status, WHITE)
+
+
+class FpsMeter:
+    """Frames per second, smoothed with an exponential moving average."""
+
+    def __init__(self, smoothing: float = 0.9) -> None:
+        self.smoothing = smoothing
+        self.fps = 0.0
+        self._last: float | None = None
+
+    def tick(self, now: float) -> float:
+        if self._last is not None and now > self._last:
+            instant = 1.0 / (now - self._last)
+            self.fps = instant if self.fps == 0.0 else self.smoothing * self.fps + (1 - self.smoothing) * instant
+        self._last = now
+        return self.fps
+
+
+# --- optional dependencies and setup messages --------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Vision:
+    cv2: Any
+    mp: Any
+    base_options: Any  # mediapipe.tasks.python.BaseOptions
+    vision: Any  # mediapipe.tasks.python.vision
+
+
+def load_vision() -> Vision | None:
+    """Import OpenCV and MediaPipe lazily. None when either is not installed."""
+    os.environ.setdefault("GLOG_minloglevel", "2")  # quieter MediaPipe native logs
+    try:
+        import cv2
+        import mediapipe as mp
+        from mediapipe.tasks.python import BaseOptions, vision
+    except ImportError:
+        return None
+    return Vision(cv2, mp, BaseOptions, vision)
+
+
+def model_help(path: Path) -> str:
+    return (
+        f"MediaPipe hand model not found: {path}\n"
+        "Download it once (a few MB, from Google's MediaPipe model storage) from the repo root:\n"
+        "  mkdir -p models\n"
+        f"  curl -fL -o models/hand_landmarker.task {MODEL_URL}\n"
+        "Or point to an existing copy with --model PATH. (models/ is git-ignored.)"
+    )
+
+
+def camera_help(index: int) -> str:
+    return (
+        f"Could not open camera {index}.\n"
+        "- macOS: System Settings > Privacy & Security > Camera: allow the app running this\n"
+        "  command (Terminal, iTerm, Cursor, VS Code), then quit and reopen that app.\n"
+        "- If macOS just asked for camera access, allow it and run the command again.\n"
+        "- Close other apps using the camera (FaceTime, Zoom, Photo Booth), or try --camera 1."
+    )
+
+
+def create_landmarker(v: Vision, model_path: Path) -> Any:
+    options = v.vision.HandLandmarkerOptions(
+        base_options=v.base_options(model_asset_path=str(model_path)),
+        running_mode=v.vision.RunningMode.VIDEO,
+        num_hands=1,
+    )
+    return v.vision.HandLandmarker.create_from_options(options)
+
+
+# --- live loop ---------------------------------------------------------------------------------------
+
+
+def detect_hand(v: Vision, landmarker: Any, frame: Any, timestamp_ms: int) -> list[tuple[float, float]] | None:
+    """Raw normalized (x, y) of the first detected hand in the (unmirrored) frame."""
+    rgb = v.cv2.cvtColor(frame, v.cv2.COLOR_BGR2RGB)
+    image = v.mp.Image(image_format=v.mp.ImageFormat.SRGB, data=rgb)
+    result = landmarker.detect_for_video(image, timestamp_ms)
+    if not result.hand_landmarks:
+        return None
+    return [(float(lm.x), float(lm.y)) for lm in result.hand_landmarks[0][:HAND_LANDMARK_COUNT]]
+
+
+def _label(cv2: Any, img: Any, text: str, org: Pixel, color: tuple[int, int, int], scale: float = 0.6) -> None:
+    (tw, th), baseline = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+    x, y = org
+    cv2.rectangle(img, (x - 4, y - th - 6), (x + tw + 4, y + baseline + 2), BLACK, -1)
+    cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+
+
+def draw_overlay(cv2: Any, img: Any, model: OverlayModel, fps: float) -> None:
+    height, width = img.shape[:2]
+    for a, b in HAND_CONNECTIONS:
+        pa, pb = (model.points[a], model.points[b]) if model.points else (None, None)
+        if pa is not None and pb is not None:
+            cv2.line(img, pa, pb, BONE, 2, cv2.LINE_AA)
+    for index, point in enumerate(model.points):
+        if point is not None:
+            cv2.circle(img, point, 6 if index in (5, 8) else 4, CYAN if index in (5, 8) else GREEN, -1, cv2.LINE_AA)
+    if model.ray is not None and model.finger is not None:
+        cv2.line(img, *model.ray, CYAN, 3, cv2.LINE_AA)
+        cv2.line(img, *model.finger, CYAN, 6, cv2.LINE_AA)
+
+    _label(cv2, img, "MORPH POINT DEBUG", (12, 30), WHITE, 0.7)
+    if model.hand_detected:
+        _label(cv2, img, "HAND DETECTED", (12, 62), GREEN)
+        if model.note:
+            _label(cv2, img, f"no ray: {model.note}", (12, 126), YELLOW, 0.5)
+    else:
+        _label(cv2, img, "NO HAND", (12, 62), RED)
+    _label(cv2, img, f"FPS {fps:4.1f}", (max(12, width - 130), 30), WHITE)
+    _label(cv2, img, "Press Q or Esc to quit", (12, height - 16), WHITE, 0.55)
+
+
+def _label_centered(cv2: Any, img: Any, text: str, center_x: int, y: int, color: tuple[int, int, int]) -> None:
+    (tw, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+    _label(cv2, img, text, (center_x - tw // 2, y), color, 0.55)
+
+
+def _ellipse(cv2: Any, img: Any, zone: TargetZone, grow: int, color: tuple[int, int, int], thickness: int) -> None:
+    axes = (zone.axes[0] + grow, zone.axes[1] + grow)
+    cv2.ellipse(img, zone.center, axes, 0, 0, 360, color, thickness, cv2.LINE_AA)
+
+
+def draw_targets(cv2: Any, img: Any, zones: tuple[TargetZone, ...], frame: PointFrame, now: float) -> None:
+    """Target zones, with the current candidate / locked / ambiguous targets highlighted."""
+    result = frame.result
+    best = result.target_id if result is not None else None
+    second = (
+        result.second_candidate.target.id
+        if result is not None and result.second_candidate is not None
+        else None
+    )
+    for zone in zones:
+        label = zone.name
+        _ellipse(cv2, img, zone, 0, zone.color, 2)
+        cv2.circle(img, zone.center, 6, zone.color, -1, cv2.LINE_AA)
+        if frame.locked and zone.id is best:
+            _ellipse(cv2, img, zone, 0, zone.color, 8)  # solid, bright
+            _ellipse(cv2, img, zone, 8, WHITE, 2)
+            cv2.circle(img, zone.center, 16, zone.color, -1, cv2.LINE_AA)
+            label = f"LOCKED: {zone.name}"
+        elif frame.state is SelectionState.CANDIDATE and zone.id is best and result is not None:
+            p = pulse(now)
+            _ellipse(cv2, img, zone, round(6 * p), WHITE, 2 + round(4 * p))  # pulsing outline
+            label = f"{zone.name} {result.confidence:.0%}"
+        elif frame.state is SelectionState.AMBIGUOUS and zone.id in (best, second):
+            _ellipse(cv2, img, zone, 4, ORANGE, 3)
+            label = f"{zone.name}?"
+        _label_centered(cv2, img, label, zone.center[0], zone.center[1] - zone.axes[1] - 12, zone.color)
+
+
+def draw_selection(cv2: Any, img: Any, frame: PointFrame) -> None:
+    height = img.shape[0]
+    status = selection_status(frame)
+    if status is not None:
+        _label(cv2, img, status[0], (12, 96), status[1], 0.75)
+    _label(cv2, img, frame.summary(), (12, height - 46), WHITE, 0.5)
+
+
+def _loop(v: Vision, cap: Any, landmarker: Any, pipeline: PointPipeline) -> int:
+    cv2 = v.cv2
+    meter = FpsMeter()
+    failed_reads = 0
+    last_ts = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            failed_reads += 1
+            if failed_reads >= MAX_FAILED_READS:
+                print("Camera stopped delivering frames (disconnected or access revoked).", file=sys.stderr)
+                return EXIT_CAMERA
+            cv2.waitKey(10)
+            continue
+        failed_reads = 0
+        timestamp_ms = max(last_ts + 1, int(time.monotonic() * 1000))  # must strictly increase
+        last_ts = timestamp_ms
+
+        raw = detect_hand(v, landmarker, frame, timestamp_ms)
+        point = pipeline.process(raw)  # same pipeline (and smoother) every frame
+        if point.just_locked and point.result is not None and point.result.target_id is not None:
+            print(f"LOCKED: {short_name(point.result.target_id)} (confidence {point.result.confidence:.2f})", flush=True)
+
+        display = cv2.flip(frame, 1)  # mirror; landmarks, ray and zones are mirrored to match
+        height, width = display.shape[:2]
+        now = time.monotonic()
+        draw_targets(cv2, display, target_zones(pipeline.config, width, height), point, now)
+        overlay = build_overlay(raw, width, height, pipeline.config.min_ray_length)
+        draw_overlay(cv2, display, overlay, meter.tick(now))
+        draw_selection(cv2, display, point)
+        cv2.imshow(WINDOW_TITLE, display)
+
+        if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
+            return EXIT_OK
+        if cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
+            return EXIT_OK  # window closed with its close button
+
+
+def run(
+    camera_index: int,
+    model_path: Path,
+    vision: Vision | None = None,
+    config: TargetConfig | None = None,
+) -> int:
+    v = vision if vision is not None else load_vision()
+    if v is None:
+        print(MISSING_DEPS_MESSAGE, file=sys.stderr)
+        return EXIT_SETUP
+    if not model_path.is_file():
+        print(model_help(model_path), file=sys.stderr)
+        return EXIT_SETUP
+
+    cv2 = v.cv2
+    cap = None
+    landmarker = None
+    try:
+        cap = cv2.VideoCapture(camera_index)
+        if not cap.isOpened():
+            print(camera_help(camera_index), file=sys.stderr)
+            return EXIT_CAMERA
+        try:
+            landmarker = create_landmarker(v, model_path)
+        except Exception as exc:  # corrupt/incompatible model file
+            print(f"Could not load the MediaPipe hand model {model_path}: {exc}", file=sys.stderr)
+            return EXIT_SETUP
+        # One pipeline (and one TemporalSmoother) for the whole session, reused every frame.
+        pipeline = PointPipeline(config if config is not None else default_config())
+        print(f"Camera {camera_index} open. Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
+        return _loop(v, cap, landmarker, pipeline)
+    except KeyboardInterrupt:
+        print("\nStopped (Ctrl+C).")
+        return EXIT_OK
+    finally:
+        if landmarker is not None:
+            landmarker.close()
+        if cap is not None:
+            cap.release()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)  # lets macOS actually close the window
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python -m morph_pi.camera_debug",
+        description="MORPH live POINT viewer: webcam + MediaPipe landmarks + pointing ray + live "
+        "target selection. Debug-only: no hardware, serial, or network.",
+    )
+    parser.add_argument("--camera", type=int, default=0, help="camera index (default: 0)")
+    parser.add_argument(
+        "--model", type=Path, default=DEFAULT_MODEL_PATH,
+        help=f"MediaPipe hand_landmarker.task path (default: {DEFAULT_MODEL_PATH.relative_to(REPO_ROOT)})",
+    )
+    parser.add_argument("--config", metavar="PATH", help="target layout JSON (default: built-in defaults)")
+    args = parser.parse_args(argv)
+    if args.camera < 0:
+        parser.error("--camera must be >= 0")
+    try:
+        config = load_config(args.config) if args.config else default_config()
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE
+    return run(args.camera, args.model, config=config)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

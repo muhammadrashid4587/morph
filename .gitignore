@@ -19,6 +19,7 @@ htmlcov/
 
 # --- Virtual environments ---
 .venv/
+.venv*/
 venv/
 env/
 ENV/
@@ -43,3 +44,7 @@ desktop.ini
 *.swp
 *.swo
 *~
+
+# --- Downloaded ML model files (never committed) ---
+models/
+*.task

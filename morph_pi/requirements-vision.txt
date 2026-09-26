@@ -1,0 +1,15 @@
+# Optional: live webcam hand tracking (python -m morph_pi.camera_debug).
+# Not needed for simulations or tests. Install on top of the root requirements:
+#   pip install -r morph_pi/requirements-vision.txt
+#
+# mediapipe depends on opencv-contrib-python and provides `cv2` through it.
+# Do NOT also install opencv-python: two OpenCV packages overwrite each other's cv2.
+#
+# The hand model (hand_landmarker.task) is a separate download; see the README
+# ("Live Camera Debug"). It lives in models/, which is git-ignored.
+#
+# mediapipe is held below 1.0: 1.0.x crashes on macOS with the DrishtiMetalHelper
+# bug. Known good: mediapipe 0.10.21 on Python 3.11 (use a Python 3.11 venv, e.g.
+# .venv311, for the live camera viewer).
+mediapipe>=0.10.21,<1.0
+opencv-contrib-python>=4.9

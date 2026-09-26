@@ -307,6 +307,9 @@ hand landmarks ──▶ pointing ray ──▶ select_target() ──▶ Tempor
 | `simulate.py` | Deterministic scenarios with built-in expectations |
 | `app.py` | CLI |
 | `config.py` | Default constants |
+| `hand_tracking.py` | Pure helpers for live landmarks: `HandObservation`, `ray_from_landmarks`, mirroring |
+| `live_point.py` | Live pipeline: landmarks → ray → `select_target` → one per-session `TemporalSmoother` |
+| `camera_debug.py` | Optional live webcam viewer (OpenCV + MediaPipe, imported lazily) |
 
 ### Coordinates and targets
 
@@ -438,6 +441,126 @@ landmarks slightly outside [0, 1] when a hand is partly off-frame. The future
 adapter must treat those frames as "no hand" (or clamp them), because
 `Point2D` rejects them.
 
+## Live Camera Debug
+
+A live viewer that proves hand tracking works on your laptop webcam. It
+shows:
+- the mirrored camera image
+- one detected hand, with its 21 landmarks and connections
+- a bright cyan pointing ray from the index MCP (landmark 5) through the index
+  fingertip (landmark 8), extended to the image edge
+- **HAND DETECTED** / **NO HAND**, and the frame rate (FPS)
+
+**This viewer only shows the pointing ray.** It does not select blocks
+yet, and it controls no hardware and sends nothing over the network.
+
+### Setup (macOS)
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -r morph_pi/requirements-vision.txt
+```
+
+The vision packages (MediaPipe, plus the OpenCV build it depends on) are
+**optional**. Simulations and `pytest` work without them.
+`requirements-vision.txt` deliberately does **not** list `opencv-python`:
+installing it next to MediaPipe's `opencv-contrib-python` gives two
+conflicting `cv2` modules.
+
+**One-time model download (required).** MediaPipe's Hand Landmarker needs a
+model file, `hand_landmarker.task` (a few MB, published by Google). It is not
+downloaded automatically. Fetch it once from the repo root:
+
+```bash
+mkdir -p models
+curl -fL -o models/hand_landmarker.task \
+  https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
+```
+
+`models/` and `*.task` are git-ignored, so the model is never committed. To
+use a copy stored elsewhere, pass `--model PATH`.
+
+### Run
+
+```bash
+python -m morph_pi.camera_debug              # camera 0
+python -m morph_pi.camera_debug --camera 1   # another camera
+```
+
+- **Camera permission:** the first time, macOS may ask to allow **Camera**
+  access for the app running the command (Terminal, iTerm, Cursor, VS Code).
+  Allow it, then run the command again. If you denied access earlier, turn it
+  on in *System Settings → Privacy & Security → Camera* and restart that app.
+- **Quit:** press **Q** or **Esc** with the window focused, or close the
+  window, or press **Ctrl+C** in the terminal. Each of these releases the
+  camera.
+- **If the ray disappears** while a hand is still detected, a yellow line
+  explains why. The usual cause is part of the hand being outside the image:
+  landmarks outside [0, 1] are rejected, never clamped.
+- **Exit codes:** 0 normal quit, 1 camera unavailable or lost, 2 usage error,
+  3 missing setup (vision packages or model file).
+
+Detection runs on the **unmirrored** camera frame, which is the coordinate
+space target selection will use. The image, landmarks and ray are mirrored
+together, only for display.
+
+### Live target selection in the viewer
+
+The viewer feeds each frame's pointing ray through the real selection logic,
+the same code and 12-frame rule as `--simulate`:
+
+```
+hand landmarks ─▶ ray_from_landmarks() ─▶ select_target(ray, config) ─▶ TemporalSmoother.update()
+                  no hand / no ray ─▶ smoother.reset()
+```
+
+`live_point.PointPipeline` owns **one** `TemporalSmoother` for the whole
+session. It is created once when the camera opens and reused for every
+frame, which is what lets a 12-frame streak build up.
+
+```bash
+python -m morph_pi.camera_debug                           # default target layout
+python -m morph_pi.camera_debug --config targets.json     # custom layout (see "Target config JSON")
+```
+
+On screen:
+- **Target zones:** an ellipse per block, drawn in its color and labeled
+  BLUE, YELLOW or GREEN. Each ellipse is the region within `max_ray_distance`
+  (0.12) of the target, so the ray must cross it for the target to count. It
+  is an ellipse because normalized x and y are scaled by the image width and
+  height.
+- **Status line and highlight:**
+
+  | State | Status line | Highlight |
+  |---|---|---|
+  | Candidate | `CANDIDATE: BLUE 96%` | Pulsing white outline on the candidate |
+  | Locked | `LOCKED: BLUE` | Solid, filled highlight |
+  | Ambiguous | `AMBIGUOUS` (orange) | Orange outline on both rivals |
+  | No target | `NO TARGET` | None |
+  | No ray | `NO RAY` | None |
+  | No hand | `NO HAND` | None |
+
+- **Summary line** at the bottom, for example
+  `state=CANDIDATE target=BLUE confidence=0.78 frames=5/12`.
+
+**LOCKED stays on while you keep pointing.** `STABLE` is emitted on exactly
+one frame, the 12th, so the viewer shows `LOCKED` from that frame until you
+release. Release means no hand, no ray, an ambiguous or no-target frame, or
+switching targets. On the held frames the summary line shows the smoother's
+actual state: `state=CANDIDATE ... (locked)`. The terminal also prints one
+`LOCKED: BLUE (confidence 0.96)` line per gesture.
+
+**Mirroring:** target positions are in camera coordinates, like the hand
+landmarks. With the default layout, BLUE (camera x = 0.20) therefore appears
+on the **right** of the mirrored window. That matches the real world when the
+camera faces you. To put BLUE on the left in the mirror view, swap the blue
+and green `x` values in a `--config` file.
+
+This is still visualization only: nothing is sent over serial or WebSocket,
+and no hardware moves.
+
 ## Scope
 
 In scope today:
@@ -445,11 +568,12 @@ In scope today:
   executors, optional token auth, and the demo client
 - `morph_pi` POINT selection: geometry, target config, per-frame selection,
   temporal smoothing and simulations
+- an optional live webcam viewer for hand landmarks, the pointing ray, and
+  live target selection (debug visualization only)
 - tests for all of it
 
 **Intentionally deferred:**
-- in `morph_pi`: camera capture, MediaPipe, OpenCV, serial/ESP32
-  communication, robot actuation (motors, servos, LEDs, LCD, gripper), and
-  sending results to the desktop agent over the network
+- in `morph_pi`: serial/ESP32 communication, robot actuation (motors, servos, LEDs, LCD,
+  gripper), and sending results to the desktop agent over the network
 - elsewhere: speech recognition, active-app detection, dashboards, and any
   cloud service
