@@ -1,4 +1,4 @@
-# MORPH — desktop agent
+# MORPH
 
 **MORPH** is a mobile, embodied interface for a computer. Instead of fixed menus
 and keyboard shortcuts, you *point*. MORPH works out what you meant, *physically
@@ -8,9 +8,14 @@ same dial adjusts volume while music plays, flips slides during a presentation,
 selects targets when steering the robot, and records gestures in teach mode.
 The loop is **POINT → CONFIRM → ADAPT → ACT**. MORPH is an OwlHacks HCI project.
 
-This repository holds the first building block: **`morph_desktop`**, a small,
-local, strictly validated service that turns JSON actions into laptop actions.
-It runs in **safe mock mode by default**.
+This repository holds two building blocks so far:
+
+- **`morph_desktop`**: a small, local, strictly validated service that turns
+  JSON actions into laptop actions. It runs in **safe mock mode by default**.
+- **`morph_pi`**: the Pi-side **POINT** logic. It turns an index-finger
+  pointing ray into "which block did the user mean?". It is pure,
+  deterministic Python and needs no camera or hardware. See
+  [POINT target selection](#point-target-selection-morph_pi).
 
 ## Architecture
 
@@ -28,9 +33,10 @@ It runs in **safe mock mode by default**.
 - Raspberry Pi vision/HCI → **WebSocket** → `morph_desktop` → laptop actions
 - Raspberry Pi vision/HCI → **serial JSON** → ESP32 → motors / LCD / LEDs
 
-Only `morph_desktop` exists so far. The Pi and ESP32 code will come later.
+So far this repo has `morph_desktop` and the pure-logic core of the Pi side
+(`morph_pi`). Camera capture, serial and ESP32 code will come later.
 
-| Module | Responsibility |
+| `morph_desktop` module | Responsibility |
 |---|---|
 | `protocol.py` | Typed action dataclasses, strict validation, response builders |
 | `context.py` | The four interaction contexts and what the dial means in each one |
@@ -274,10 +280,176 @@ Tips for the Pi code:
 - On reconnect, authenticate again: authorization never carries over to a
   new connection.
 
+## POINT target selection (`morph_pi`)
+
+`morph_pi` implements the first step of **POINT → CONFIRM → ADAPT → ACT**:
+the user points at one of three known blocks on the table, and MORPH decides
+which one they mean. It outputs clean semantic results only. A later module
+will use a STABLE result to make the robot point back for confirmation.
+`morph_pi` itself never controls hardware.
+
+### Pipeline
+
+```
+hand landmarks ──▶ pointing ray ──▶ select_target() ──▶ TemporalSmoother ──▶ SelectionResult
+ (future camera     landmark 5 →      one frame:           12-frame streak,     state, target,
+  + MediaPipe)      landmark 8        NONE / CANDIDATE /   emits STABLE once    confidence, reason
+                                      AMBIGUOUS
+```
+
+| `morph_pi` module | Responsibility |
+|---|---|
+| `models.py` | Validated dataclasses and enums: `Point2D`, `Ray2D`, `TargetId`, `Target`, `Candidate`, `SelectionState`, `SelectionResult`, `TargetConfig` |
+| `geometry.py` | Pure ray math: direction, forward projection, distance to the ray, behind and degenerate checks, `ray_from_hand_landmarks` |
+| `selection.py` | Per-frame geometric selection and confidence. It **never** returns STABLE |
+| `smoothing.py` | `TemporalSmoother`: turns a streak of frames into one STABLE event |
+| `targets.py` | Default targets, JSON config load/save/validation |
+| `simulate.py` | Deterministic scenarios with built-in expectations |
+| `app.py` | CLI |
+| `config.py` | Default constants |
+
+### Coordinates and targets
+
+All coordinates are **normalized image coordinates**: `x` runs from 0 on the
+left to 1 on the right, and `y` from 0 at the top to 1 at the bottom (the
+MediaPipe convention). Every coordinate must be finite and within
+`[0.0, 1.0]`; anything else raises `ValueError`.
+
+The pointing ray starts at the **index MCP (landmark 5)** and passes through
+the **index fingertip (landmark 8)**.
+
+| Target | `TargetId` | Default center |
+|---|---|---|
+| Blue block | `BLUE_BLOCK` | x=0.20, y=0.62 |
+| Yellow block | `YELLOW_BLOCK` | x=0.50, y=0.62 |
+| Green block | `GREEN_BLOCK` | x=0.80, y=0.62 |
+
+### Rules
+
+Per frame (`select_target`):
+
+1. The ray is **degenerate** if landmark 5 → landmark 8 is shorter than
+   `min_ray_length` (0.01). That gives `NONE`.
+2. A target is valid only if it is **ahead of the ray origin** and its distance
+   to the ray is **≤ 0.12**. Distance is perpendicular to the ray, never
+   measured behind the hand. If no target is valid, the result is `NONE`.
+3. The **best** candidate has the lowest distance. Exact ties resolve in the
+   order blue, yellow, green.
+4. Confidence is a number in [0, 1], computed deterministically:
+   `confidence = 0.5 · closeness + 0.5 · separation`
+   - `closeness = 1 − d_best / 0.12`
+   - `separation = (d_second − d_best) / 0.12`, or 1 when no other target is valid
+5. The result is **`AMBIGUOUS`** if `d_second − d_best < 0.035` **or**
+   `confidence < 0.65`. Both comparisons are strict. Otherwise it is
+   **`CANDIDATE`**.
+
+Over time (`TemporalSmoother`):
+
+6. The same `CANDIDATE` target for **12 consecutive frames** becomes
+   **`STABLE`** on the 12th frame, with `stable_target` set.
+7. `STABLE` is emitted **exactly once per sustained gesture**. While the user
+   keeps pointing, later frames report `CANDIDATE`, shown as `(held)` in the
+   simulation output. Consumers can simply act on `state == STABLE`.
+8. A `NONE` or `AMBIGUOUS` frame, a **different** candidate, or `reset()` ends
+   the gesture. The streak starts over and the same target can become
+   `STABLE` again after a fresh 12-frame streak.
+
+Every threshold can be changed in the target config.
+
+### Run it
+
+```bash
+python -m morph_pi.app --show-targets                         # targets + thresholds
+python -m morph_pi.app --simulate                             # all scenarios, PASS/FAIL each
+python -m morph_pi.app --simulate --scenario blue             # one scenario
+python -m morph_pi.app --simulate --scenario ambiguous -v     # with per-frame reasons
+python -m morph_pi.app --save-default-targets targets.json    # editable config (add --force to overwrite)
+python -m morph_pi.app --config targets.json --show-targets
+python -m morph_pi.app --config targets.json --simulate
+```
+
+Scenarios: `blue`, `yellow` and `green` each point clearly at one block for
+16 frames and must give STABLE exactly once, at frame 12. The others are:
+
+| Scenario | What it does | Expected result |
+|---|---|---|
+| `ambiguous` | Points between blue and yellow | Never STABLE |
+| `none` | Degenerate, too-short and pointing-away rays | Always NONE |
+| `reacquire` | Blue for 8 frames, 3 frames of no target, then blue again | Needs a fresh 12-frame streak |
+| `release` | Stable, hold, release, point again | STABLE twice |
+
+The scenario rays are built from the loaded config's target positions, so
+`--config` layouts get the same checks. Exit codes: 0 for success, 1 if a
+scenario fails its expectations, 2 for a usage or config error.
+
+```
+frame=01 state=CANDIDATE target=BLUE_BLOCK confidence=0.96 streak=1
+...
+frame=12 state=STABLE target=BLUE_BLOCK confidence=0.96 streak=12
+frame=13 state=CANDIDATE target=BLUE_BLOCK confidence=0.96 streak=13 (held)
+```
+
+### Target config JSON
+
+Targets are keyed by id. `label`, `color` and every threshold are optional
+and fall back to the defaults.
+
+```json
+{
+  "targets": {
+    "blue_block":   {"x": 0.2, "y": 0.62, "label": "Blue block", "color": "blue"},
+    "yellow_block": {"x": 0.5, "y": 0.62, "label": "Yellow block", "color": "yellow"},
+    "green_block":  {"x": 0.8, "y": 0.62, "label": "Green block", "color": "green"}
+  },
+  "thresholds": {
+    "max_ray_distance": 0.12,
+    "ambiguity_margin": 0.035,
+    "min_confidence": 0.65,
+    "stable_frames": 12,
+    "min_ray_length": 0.01,
+    "closeness_weight": 0.5
+  }
+}
+```
+
+The loader rejects any of the following with an error that names the field:
+invalid JSON, unknown keys (so typos can't go unnoticed), duplicate keys or
+target ids, unknown or missing targets, out-of-range or non-finite
+coordinates, two targets at the same center, and invalid thresholds.
+
+### Using it from code
+
+```python
+from morph_pi.geometry import ray_from_hand_landmarks
+from morph_pi.selection import select_target
+from morph_pi.smoothing import TemporalSmoother
+from morph_pi.targets import default_config
+
+config = default_config()
+smoother = TemporalSmoother(config.stable_frames)
+for landmarks in hand_landmark_frames:            # 21 Point2D per frame (future MediaPipe adapter)
+    result = smoother.update(select_target(ray_from_hand_landmarks(landmarks), config))
+    if result.state.name == "STABLE":
+        ...                                         # future: tell the robot to point back
+```
+
+When no hand is visible, call `smoother.reset()`. MediaPipe can report
+landmarks slightly outside [0, 1] when a hand is partly off-frame. The future
+adapter must treat those frames as "no hand" (or clamp them), because
+`Point2D` rejects them.
+
 ## Scope
 
-In scope today: the local desktop agent, the protocol, context state, the
-mock/real executors, the demo client and the tests.
+In scope today:
+- the local desktop agent, its protocol, context state, the mock/real
+  executors, optional token auth, and the demo client
+- `morph_pi` POINT selection: geometry, target config, per-frame selection,
+  temporal smoothing and simulations
+- tests for all of it
 
-Not in scope yet: Pi vision and MediaPipe, camera tracking, ESP32 firmware,
-speech recognition, active-app detection, dashboards, and any cloud service.
+**Intentionally deferred:**
+- in `morph_pi`: camera capture, MediaPipe, OpenCV, serial/ESP32
+  communication, robot actuation (motors, servos, LEDs, LCD, gripper), and
+  sending results to the desktop agent over the network
+- elsewhere: speech recognition, active-app detection, dashboards, and any
+  cloud service
