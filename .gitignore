@@ -51,3 +51,6 @@ models/
 
 # --- Generated speech audio (ElevenLabs cache) ---
 voice_cache/
+
+# --- morph_nano local event database ---
+morph_nano/events.db
