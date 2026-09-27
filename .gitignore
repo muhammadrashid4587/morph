@@ -48,3 +48,7 @@ desktop.ini
 # --- Downloaded ML model files (never committed) ---
 models/
 *.task
+
+# --- Firmware build output ---
+firmware/esp32/build/
+.pio/

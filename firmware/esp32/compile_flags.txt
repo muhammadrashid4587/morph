@@ -1,0 +1,8 @@
+-xc++
+-std=c++17
+-Ilib/morph_core/src
+-Iinclude
+-Isrc
+-Itest/host
+-Wall
+-Wextra

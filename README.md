@@ -561,6 +561,28 @@ and green `x` values in a `--config` file.
 This is still visualization only: nothing is sent over serial or WebSocket,
 and no hardware moves.
 
+## ESP32 firmware (`firmware/esp32`)
+
+The robot-side firmware:
+- the Pi ↔ ESP32 serial protocol, exactly as in the integration contract
+- buttons, touch pad, dial (encoder or joystick), LED/LCD output, a latched
+  e-stop, the heartbeat watchdog, and servo/stepper arm poses
+- a brushless ESC held at its stop pulse
+
+**No hardware is confirmed yet, so every device is disabled.** Each one turns
+on when its pins and parameters are filled into
+`firmware/esp32/include/hardware_config.h`.
+
+```bash
+cd firmware/esp32
+make test            # core unit tests on your Mac (no board needed)
+make sim && ./build/morph_sim --demo-config   # talk to it like the Pi does
+pio run -e esp32dev  # compile for the ESP32 (needs PlatformIO; do not upload yet)
+```
+
+See [`firmware/esp32/README.md`](firmware/esp32/README.md) for the safety
+rules, contract interpretations, and the hardware details still needed.
+
 ## Scope
 
 In scope today:
@@ -570,6 +592,9 @@ In scope today:
   temporal smoothing and simulations
 - an optional live webcam viewer for hand landmarks, the pointing ray, and
   live target selection (debug visualization only)
+- ESP32 firmware: the contract serial protocol, the safety logic, and input
+  and motor drivers that stay disabled until the hardware is confirmed (not
+  flashed yet)
 - tests for all of it
 
 **Intentionally deferred:**
