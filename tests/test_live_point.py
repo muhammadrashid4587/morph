@@ -298,9 +298,10 @@ def test_cli_passes_custom_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     path = tmp_path / "targets.json"
     path.write_text(json.dumps(data))
     seen: dict[str, Any] = {}
-    monkeypatch.setattr(camera_debug, "run", lambda camera, model, config=None: seen.update(config=config) or 0)
+    monkeypatch.setattr(camera_debug, "run", lambda camera, model, config=None, **kw: seen.update(config=config, **kw) or 0)
     assert camera_debug.main(["--config", str(path)]) == 0
     assert seen["config"].stable_frames == 6
+    assert seen["mode"] == "colors"  # colors stays the default
 
 
 def test_cli_invalid_config_is_a_usage_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

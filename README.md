@@ -561,6 +561,40 @@ and green `x` values in a `--config` file.
 This is still visualization only: nothing is sent over serial or WebSocket,
 and no hardware moves.
 
+### Any-object mode (`--mode objects`)
+
+By default the viewer locks onto the three colored targets (`--mode colors`).
+With `--mode objects` it locks onto **any object the finger points at**, found
+by MediaPipe's ObjectDetector with EfficientDet-Lite0 (int8). This works with
+MediaPipe 0.10.18 (Pi) and 0.10.21 (Mac).
+
+Download the model once, from the repo root (about 4.6 MB; `models/` is git-ignored):
+
+```bash
+mkdir -p models
+curl -fL -o models/efficientdet_lite0.tflite \
+  https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite
+```
+
+```bash
+python -m morph_pi.camera_debug --mode objects
+```
+
+- **Which box is chosen:**
+  1. the detected box the pointing ray hits first
+  2. otherwise the box nearest the fingertip (within 0.15)
+  3. otherwise the region under the fingertip, shown as `LOCKED: OBJECT`
+
+  Boxes that contain the pointing hand itself, such as your own `person` box,
+  are ignored.
+- **On screen:** every box is drawn faintly. The chosen box is bold, labeled
+  e.g. `CUP (0.87)`, and becomes `LOCKED: CUP (0.87)` after the same 12-frame
+  rule as the colors. The lock fires once per gesture and is released when
+  you point elsewhere or drop your hand.
+- **Pi speed:** the detector runs on every 3rd frame, on a 320-pixel-wide copy
+  of the image, and its boxes are reused in between. The hand tracker still
+  runs on every frame.
+
 ## Voice and Gemini agent (`morph_voice`, `morph_agent`)
 
 MORPH can listen and talk. Press Enter and speak; MORPH transcribes you with

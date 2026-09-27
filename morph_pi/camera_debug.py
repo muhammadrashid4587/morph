@@ -40,6 +40,7 @@ from .hand_tracking import (
     ray_rejection_reason,
 )
 from .live_point import PointFrame, PointPipeline, short_name
+from .objects import Box, EveryNth, ObjectFrame, ObjectPointPipeline, boxes_from_detections
 from .models import SelectionState, TargetConfig, TargetId
 from .targets import ConfigError, default_config, load_config
 
@@ -52,6 +53,12 @@ MODEL_URL = (
 )
 
 EXIT_OK, EXIT_CAMERA, EXIT_USAGE, EXIT_SETUP = 0, 1, 2, 3
+DEFAULT_OBJECT_MODEL_PATH = REPO_ROOT / "models" / "efficientdet_lite0.tflite"
+OBJECT_MODEL_URL = (
+    "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/int8/1/efficientdet_lite0.tflite"
+)
+DETECT_EVERY = 3     # objects mode: run the detector on every 3rd frame, reuse its boxes in between
+DETECT_WIDTH = 320   # objects mode: detector input width in pixels (Pi speed)
 MAX_FAILED_READS = 30  # consecutive failed frame reads before giving up
 QUIT_KEYS = frozenset({ord("q"), ord("Q"), 27})  # 27 = Escape
 
@@ -281,6 +288,16 @@ def model_help(path: Path) -> str:
     )
 
 
+def object_model_help(path: Path) -> str:
+    return (
+        f"Object detection model not found: {path}\n"
+        "Download it once (about 4.6 MB, EfficientDet-Lite0 int8) from the repo root:\n"
+        "  mkdir -p models\n"
+        f"  curl -fL -o models/efficientdet_lite0.tflite {OBJECT_MODEL_URL}\n"
+        "Or point to it with --object-model PATH. (models/ is git-ignored.)"
+    )
+
+
 def camera_help(index: int) -> str:
     return (
         f"Could not open camera {index}.\n"
@@ -300,6 +317,18 @@ def create_landmarker(v: Vision, model_path: Path) -> Any:
     return v.vision.HandLandmarker.create_from_options(options)
 
 
+def create_object_detector(v: Vision, model_path: Path) -> Any:
+    if not all(hasattr(v.vision, name) for name in ("ObjectDetector", "ObjectDetectorOptions")):
+        raise VisionApiError("this MediaPipe build has no ObjectDetector")
+    options = v.vision.ObjectDetectorOptions(
+        base_options=v.base_options(model_asset_path=str(model_path)),
+        running_mode=v.vision.RunningMode.VIDEO,
+        max_results=5,
+        score_threshold=0.3,
+    )
+    return v.vision.ObjectDetector.create_from_options(options)
+
+
 # --- live loop ---------------------------------------------------------------------------------------
 
 
@@ -313,6 +342,18 @@ def detect_hand(v: Vision, landmarker: Any, frame: Any, timestamp_ms: int) -> li
     if not result.hand_landmarks:
         return None
     return [(float(lm.x), float(lm.y)) for lm in result.hand_landmarks[0][:HAND_LANDMARK_COUNT]]
+
+
+def detect_objects(v: Vision, detector: Any, frame: Any, timestamp_ms: int) -> list[Box]:
+    """Normalized boxes from the (unmirrored) frame, detected on a DETECT_WIDTH-wide copy."""
+    height, width = frame.shape[:2]
+    small_h = max(1, round(height * DETECT_WIDTH / width))
+    small = v.cv2.resize(frame, (DETECT_WIDTH, small_h), interpolation=v.cv2.INTER_AREA)
+    rgb = v.cv2.cvtColor(small, v.cv2.COLOR_BGR2RGB)
+    image_cls = v.image if v.image is not None else v.mp.Image
+    image_format = v.image_format if v.image_format is not None else v.mp.ImageFormat
+    result = detector.detect_for_video(image_cls(image_format=image_format.SRGB, data=rgb), timestamp_ms)
+    return boxes_from_detections(result, DETECT_WIDTH, small_h)
 
 
 def _label(cv2: Any, img: Any, text: str, org: Pixel, color: tuple[int, int, int], scale: float = 0.6) -> None:
@@ -392,6 +433,79 @@ def draw_selection(cv2: Any, img: Any, frame: PointFrame) -> None:
     _label(cv2, img, frame.summary(), (12, height - 46), WHITE, 0.5)
 
 
+def _mirrored_rect(box: Box, width: int, height: int) -> tuple[Pixel, Pixel]:
+    p0 = to_pixel(1.0 - box.x1, box.y0, width, height)
+    p1 = to_pixel(1.0 - box.x0, box.y1, width, height)
+    assert p0 is not None and p1 is not None
+    return p0, p1
+
+
+def draw_objects(cv2: Any, img: Any, frame: ObjectFrame) -> None:
+    """All detected boxes faint, the chosen one bold with its label (mirrored like the video)."""
+    height, width = img.shape[:2]
+    chosen = frame.choice.box if frame.choice is not None else None
+    for box in frame.boxes:
+        if box is chosen:
+            continue
+        p0, p1 = _mirrored_rect(box, width, height)
+        cv2.rectangle(img, p0, p1, BONE, 1, cv2.LINE_AA)
+        cv2.putText(img, f"{box.label} {box.score:.2f}", (p0[0] + 3, p0[1] + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, BONE, 1, cv2.LINE_AA)
+    if chosen is not None and frame.ray is not None:
+        color = GREEN if frame.locked else WHITE
+        p0, p1 = _mirrored_rect(chosen, width, height)
+        cv2.rectangle(img, p0, p1, color, 5 if frame.locked else 3, cv2.LINE_AA)
+        _label(cv2, img, frame.label, (p0[0], max(20, p0[1] - 8)), color, 0.6)
+
+
+def draw_object_selection(cv2: Any, img: Any, frame: ObjectFrame) -> None:
+    height = img.shape[0]
+    if frame.status != "NO HAND":
+        color = GREEN if frame.locked else (YELLOW if frame.status == "NO RAY" else WHITE)
+        _label(cv2, img, frame.label if frame.choice else frame.status, (12, 96), color, 0.75)
+    _label(cv2, img, frame.summary(), (12, height - 46), WHITE, 0.5)
+
+
+def _loop_objects(v: Vision, cap: Any, landmarker: Any, detector: Any, pipeline: ObjectPointPipeline) -> int:
+    """objects mode: lock onto any detected object the finger points at."""
+    cv2 = v.cv2
+    meter = FpsMeter()
+    schedule = EveryNth(DETECT_EVERY)
+    boxes: list[Box] = []
+    failed_reads = 0
+    last_ts = -1
+    while True:
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            failed_reads += 1
+            if failed_reads >= MAX_FAILED_READS:
+                print("Camera stopped delivering frames (disconnected or access revoked).", file=sys.stderr)
+                return EXIT_CAMERA
+            cv2.waitKey(10)
+            continue
+        failed_reads = 0
+        timestamp_ms = max(last_ts + 1, int(time.monotonic() * 1000))
+        last_ts = timestamp_ms
+
+        raw = detect_hand(v, landmarker, frame, timestamp_ms)
+        if schedule.due():
+            boxes = detect_objects(v, detector, frame, timestamp_ms)
+        found = pipeline.process(raw, boxes)
+        if found.just_locked:
+            print(found.label, flush=True)
+
+        display = cv2.flip(frame, 1)
+        height, width = display.shape[:2]
+        draw_objects(cv2, display, found)
+        draw_overlay(cv2, display, build_overlay(raw, width, height, pipeline.min_ray_length), meter.tick(time.monotonic()))
+        draw_object_selection(cv2, display, found)
+        cv2.imshow(WINDOW_TITLE, display)
+
+        if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
+            return EXIT_OK
+        if cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
+            return EXIT_OK
+
+
 def _loop(v: Vision, cap: Any, landmarker: Any, pipeline: PointPipeline) -> int:
     cv2 = v.cv2
     meter = FpsMeter()
@@ -435,6 +549,8 @@ def run(
     model_path: Path,
     vision: Vision | None = None,
     config: TargetConfig | None = None,
+    mode: str = "colors",
+    object_model: Path = DEFAULT_OBJECT_MODEL_PATH,
 ) -> int:
     try:
         v = vision if vision is not None else load_vision()
@@ -447,10 +563,14 @@ def run(
     if not model_path.is_file():
         print(model_help(model_path), file=sys.stderr)
         return EXIT_SETUP
+    if mode == "objects" and not object_model.is_file():
+        print(object_model_help(object_model), file=sys.stderr)
+        return EXIT_SETUP
 
     cv2 = v.cv2
     cap = None
     landmarker = None
+    detector = None
     try:
         cap = cv2.VideoCapture(camera_index)
         if not cap.isOpened():
@@ -461,15 +581,26 @@ def run(
         except Exception as exc:  # corrupt/incompatible model file
             print(f"Could not load the MediaPipe hand model {model_path}: {exc}", file=sys.stderr)
             return EXIT_SETUP
-        # One pipeline (and one TemporalSmoother) for the whole session, reused every frame.
-        pipeline = PointPipeline(config if config is not None else default_config())
+        config = config if config is not None else default_config()
         api = f" MediaPipe {getattr(v.mp, '__version__', '?')} via {v.api}." if v.api else ""
+        if mode == "objects":
+            try:
+                detector = create_object_detector(v, object_model)
+            except Exception as exc:  # missing API or corrupt model file
+                print(f"Could not load the object detection model {object_model}: {exc}", file=sys.stderr)
+                return EXIT_SETUP
+            print(f"Camera {camera_index} open.{api} Mode: objects. Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
+            return _loop_objects(v, cap, landmarker, detector, ObjectPointPipeline(config.stable_frames, config.min_ray_length))
+        # One pipeline (and one TemporalSmoother) for the whole session, reused every frame.
+        pipeline = PointPipeline(config)
         print(f"Camera {camera_index} open.{api} Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
         return _loop(v, cap, landmarker, pipeline)
     except KeyboardInterrupt:
         print("\nStopped (Ctrl+C).")
         return EXIT_OK
     finally:
+        if detector is not None:
+            detector.close()
         if landmarker is not None:
             landmarker.close()
         if cap is not None:
@@ -490,6 +621,14 @@ def main(argv: list[str] | None = None) -> int:
         help=f"MediaPipe hand_landmarker.task path (default: {DEFAULT_MODEL_PATH.relative_to(REPO_ROOT)})",
     )
     parser.add_argument("--config", metavar="PATH", help="target layout JSON (default: built-in defaults)")
+    parser.add_argument(
+        "--mode", choices=("colors", "objects"), default="colors",
+        help="colors: lock onto the three colored targets (default); objects: lock onto any detected object",
+    )
+    parser.add_argument(
+        "--object-model", type=Path, default=DEFAULT_OBJECT_MODEL_PATH,
+        help=f"EfficientDet-Lite0 .tflite for --mode objects (default: {DEFAULT_OBJECT_MODEL_PATH.relative_to(REPO_ROOT)})",
+    )
     args = parser.parse_args(argv)
     if args.camera < 0:
         parser.error("--camera must be >= 0")
@@ -498,7 +637,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    return run(args.camera, args.model, config=config)
+    return run(args.camera, args.model, config=config, mode=args.mode, object_model=args.object_model)
 
 
 if __name__ == "__main__":
