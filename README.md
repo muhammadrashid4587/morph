@@ -702,6 +702,35 @@ MORPH_AUDIO_OUTPUT=<speaker number or name>
 
 Then run `.venv311/bin/python -m morph_agent.demo`.
 
+## Nano controller stream (`morph_nano`)
+
+The Pi reads the Arduino Nano's controls (buttons, joystick, encoder) over
+USB serial and sends each change to a small server on the laptop. The server
+stores the changes in a local SQLite database. See `morph_nano/README.md` for
+the direct-Ethernet setup (laptop `192.168.50.1`, Pi `192.168.50.2`).
+
+**Laptop:** start the server, from the repo root:
+
+```bash
+python3 morph_nano/receive.py --port 8766 --db morph_nano/events.db
+```
+
+**Pi:** start the stream, from the repo root. Replace `<LAPTOP_IP>`, e.g.
+`192.168.50.1` on the direct link:
+
+```bash
+uv pip install --python .venv311/bin/python pyserial     # once
+.venv311/bin/python morph_nano/ingest.py --port /dev/ttyUSB0 --server http://<LAPTOP_IP>:8766
+```
+
+- **Use port 8766.** Port 8765 is the laptop agent's (`morph_desktop`).
+- **Serial port:** `ls /dev/ttyACM* /dev/ttyUSB*` shows the Nano's port. Only
+  one program can use it at a time.
+- **The database** (`morph_nano/events.db`) stays on the laptop. All `*.db`
+  and `*.sqlite` files are git-ignored.
+- **Trusted network only:** `receive.py` accepts events from anything on the
+  network, without authentication.
+
 ## Scope
 
 In scope today:

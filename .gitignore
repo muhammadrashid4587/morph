@@ -54,3 +54,11 @@ voice_cache/
 
 # --- morph_nano local event database ---
 morph_nano/events.db
+
+# --- Local databases (never committed) ---
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
