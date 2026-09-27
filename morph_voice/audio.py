@@ -119,6 +119,50 @@ def record(
     return pcm_to_wav(pcm, rate)
 
 
+class StreamRecorder:
+    """Non-blocking recording: start() opens the mic, stop() closes it and returns a WAV.
+
+    Used for push-to-talk inside a video loop (press V to start, V to stop).
+    """
+
+    def __init__(self, device: int | str | None = None, sd: Any = None) -> None:
+        self.device = device
+        self._sd = sd
+        self._stream: Any = None
+        self._chunks: list[bytes] = []
+        self._lock = threading.Lock()
+        self._rate = 0
+
+    @property
+    def recording(self) -> bool:
+        return self._stream is not None
+
+    def start(self) -> None:
+        sd = self._sd or load_sounddevice()
+        self._rate = int(sd.query_devices(self.device, "input")["default_samplerate"])
+        self._chunks = []
+
+        def callback(indata: Any, frames: int, time: Any, status: Any) -> None:
+            with self._lock:
+                self._chunks.append(bytes(indata))
+
+        stream = sd.RawInputStream(samplerate=self._rate, channels=1, dtype="int16", device=self.device, callback=callback)
+        stream.start()
+        self._stream = stream
+
+    def stop(self) -> bytes:
+        stream, self._stream = self._stream, None
+        if stream is None:
+            raise ValueError("not recording")
+        stream.stop()
+        stream.close()
+        with self._lock:
+            pcm = b"".join(self._chunks)
+        if len(pcm) < MIN_RECORDING_S * self._rate * 2:
+            raise ValueError("recording too short: press V, speak, then press V again")
+        return pcm_to_wav(pcm, self._rate)
+
+
 def list_devices(sd: Any = None) -> str:
     sd = sd or load_sounddevice()
     return str(sd.query_devices())

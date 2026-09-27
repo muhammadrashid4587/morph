@@ -7,12 +7,14 @@ action for servos, the arm, the Nano, shell commands or arbitrary messages.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 ACTIONS: tuple[str, ...] = ("set_mode", "next_slide", "prev_slide", "volume_up", "volume_down", "say", "none")
 MODES: tuple[str, ...] = ("robot_targeting", "presentation", "music")
-TARGETS: tuple[str, ...] = ("blue", "yellow", "green")
+TARGETS: tuple[str, ...] = ("blue", "yellow", "green")  # colored blocks; any detected object label also works
+MAX_TARGET_CHARS = 40
 VOLUME_STEP = 10  # laptop volume_delta allows -10..10
 MAX_REPLY_CHARS = 200
 FALLBACK_REPLY = "Sorry, I can't do that."
@@ -21,13 +23,16 @@ FALLBACK_REPLY = "Sorry, I can't do that."
 @dataclass(frozen=True, slots=True)
 class MorphState:
     mode: str = "robot_targeting"
-    locked_target: str | None = None  # "blue" / "yellow" / "green", or None
+    locked_target: str | None = None  # "blue" / "yellow" / "green", a detected object label like "cup", or None
 
     def __post_init__(self) -> None:
         if self.mode not in MODES:
             raise ValueError(f"mode must be one of {MODES}, got {self.mode!r}")
-        if self.locked_target is not None and self.locked_target not in TARGETS:
-            raise ValueError(f"locked_target must be one of {TARGETS} or None, got {self.locked_target!r}")
+        if self.locked_target is not None:
+            label = " ".join(str(self.locked_target).lower().split())
+            if not re.fullmatch(r"[a-z0-9][a-z0-9 \-]*", label) or len(label) > MAX_TARGET_CHARS:
+                raise ValueError(f"locked_target must be a short object name, got {self.locked_target!r}")
+            object.__setattr__(self, "locked_target", label)
 
 
 @dataclass(frozen=True, slots=True)

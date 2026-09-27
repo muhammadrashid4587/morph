@@ -38,6 +38,7 @@ PHRASES: tuple[str, ...] = (
     "Sorry, I didn't catch that.",
     "Sorry, I can't do that.",
     "Give me a second.",
+    "Locked on that.",
 )
 
 
@@ -95,6 +96,8 @@ class Voice:
         recorder: Callable[[Callable[[float], None], float], bytes] = audio.record,
         language_code: str = "en",
         max_seconds: float = 15.0,
+        input_device: int | str | None = None,
+        output_device: int | str | None = None,
     ) -> None:
         self.client = client
         self.voice_id = voice_id
@@ -105,6 +108,8 @@ class Voice:
         self.recorder = recorder
         self.language_code = language_code
         self.max_seconds = max_seconds
+        self.input_device = input_device    # MORPH_AUDIO_INPUT
+        self.output_device = output_device  # MORPH_AUDIO_OUTPUT
 
     def speech_audio(self, text: str) -> bytes:
         """The WAV for `text`, from the cache or freshly generated (and then cached)."""
@@ -119,6 +124,9 @@ class Voice:
 
     def say(self, text: str) -> None:
         self.player(self.speech_audio(text))
+
+    def transcribe(self, wav: bytes) -> str:
+        return self.client.stt(wav, language_code=self.language_code)
 
     def listen(self, trigger: PushToTalk | None = None) -> str:
         trigger = trigger or EnterPushToTalk()
@@ -139,13 +147,15 @@ def default_voice() -> Voice:
         if not voice_id:
             voice_id, name = client.default_voice()
             print(f"Using ElevenLabs voice '{name}' ({voice_id}). Set ELEVENLABS_VOICE_ID in .env to pin it.", file=sys.stderr)
-        device = get_setting("MORPH_AUDIO_OUTPUT") or None
-        mic = get_setting("MORPH_AUDIO_INPUT") or None
+        speaker = _device(get_setting("MORPH_AUDIO_OUTPUT") or None)
+        mic = _device(get_setting("MORPH_AUDIO_INPUT") or None)
         _default = Voice(
             client,
             voice_id,
-            player=lambda data: audio.play_wav(data, device=_device(device)),
-            recorder=lambda wait, seconds: audio.record(wait, seconds, device=_device(mic)),
+            player=lambda data: audio.play_wav(data, device=speaker),
+            recorder=lambda wait, seconds: audio.record(wait, seconds, device=mic),
+            input_device=mic,
+            output_device=speaker,
         )
     return _default
 

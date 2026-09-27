@@ -45,7 +45,9 @@ Actions:
 - set_mode: switch MORPH's mode. Put the mode in "mode": robot_targeting (point at blocks), presentation (slides) or music.
 - next_slide / prev_slide: move the presentation one slide.
 - volume_up / volume_down: change the laptop volume one step.
-- say: just answer out loud (questions about MORPH's state, greetings, help).
+- say: just answer out loud (questions about MORPH's state, greetings, help). The locked target is what the
+  person is pointing at (a colored block or any object, e.g. "cup"); for "what am I pointing at?" or
+  "tell me about this", answer about it in one short sentence. If no target is locked, say so.
 - none: the request is unclear, unsafe, or not one of these actions.
 
 Use "{NO_MODE}" for "mode" unless the action is set_mode. MORPH cannot move its arm, servos or motors by

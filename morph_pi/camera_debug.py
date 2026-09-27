@@ -61,6 +61,7 @@ DETECT_EVERY = 3     # objects mode: run the detector on every 3rd frame, reuse 
 DETECT_WIDTH = 320   # objects mode: detector input width in pixels (Pi speed)
 MAX_FAILED_READS = 30  # consecutive failed frame reads before giving up
 QUIT_KEYS = frozenset({ord("q"), ord("Q"), 27})  # 27 = Escape
+TALK_KEYS = frozenset({ord("v"), ord("V")})  # --speak: push-to-talk
 
 # BGR colors
 CYAN = (255, 255, 0)
@@ -465,7 +466,16 @@ def draw_object_selection(cv2: Any, img: Any, frame: ObjectFrame) -> None:
     _label(cv2, img, frame.summary(), (12, height - 46), WHITE, 0.5)
 
 
-def _loop_objects(v: Vision, cap: Any, landmarker: Any, detector: Any, pipeline: ObjectPointPipeline) -> int:
+def locked_label(found: ObjectFrame) -> str | None:
+    """The locked object's name for the agent/voice ("OBJECT" for the unrecognized region), else None."""
+    if not found.locked or found.choice is None:
+        return None
+    return "OBJECT" if found.choice.how == "region" else found.choice.box.label
+
+
+def _loop_objects(
+    v: Vision, cap: Any, landmarker: Any, detector: Any, pipeline: ObjectPointPipeline, voice: Any = None
+) -> int:
     """objects mode: lock onto any detected object the finger points at."""
     cv2 = v.cv2
     meter = FpsMeter()
@@ -492,16 +502,25 @@ def _loop_objects(v: Vision, cap: Any, landmarker: Any, detector: Any, pipeline:
         found = pipeline.process(raw, boxes)
         if found.just_locked:
             print(found.label, flush=True)
+            if voice is not None:
+                voice.announce_lock(locked_label(found) or "OBJECT")  # background; skipped if busy
 
         display = cv2.flip(frame, 1)
         height, width = display.shape[:2]
         draw_objects(cv2, display, found)
         draw_overlay(cv2, display, build_overlay(raw, width, height, pipeline.min_ray_length), meter.tick(time.monotonic()))
         draw_object_selection(cv2, display, found)
+        if voice is not None:
+            _label(cv2, display, voice.status or "V = talk", (max(12, width - 340), 62), YELLOW if voice.status else WHITE, 0.55)
         cv2.imshow(WINDOW_TITLE, display)
 
-        if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS:
+        key = cv2.waitKey(1) & 0xFF
+        if key in QUIT_KEYS:
             return EXIT_OK
+        if voice is not None and key in TALK_KEYS:
+            target = locked_label(found)
+            result = voice.toggle_talk("unrecognized object" if target == "OBJECT" else target)
+            print(f"[V] {result}", flush=True)
         if cv2.getWindowProperty(WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
             return EXIT_OK
 
@@ -551,6 +570,8 @@ def run(
     config: TargetConfig | None = None,
     mode: str = "colors",
     object_model: Path = DEFAULT_OBJECT_MODEL_PATH,
+    speak: bool = False,
+    voice: Any = None,
 ) -> int:
     try:
         v = vision if vision is not None else load_vision()
@@ -566,6 +587,15 @@ def run(
     if mode == "objects" and not object_model.is_file():
         print(object_model_help(object_model), file=sys.stderr)
         return EXIT_SETUP
+
+    if speak and voice is None:
+        try:
+            from .voice_link import from_env
+
+            voice = from_env()
+        except Exception as exc:  # missing ELEVENLABS_API_KEY, network, audio packages
+            print(f"error: --speak needs the voice setup: {exc}", file=sys.stderr)
+            return EXIT_SETUP
 
     cv2 = v.cv2
     cap = None
@@ -589,8 +619,10 @@ def run(
             except Exception as exc:  # missing API or corrupt model file
                 print(f"Could not load the object detection model {object_model}: {exc}", file=sys.stderr)
                 return EXIT_SETUP
-            print(f"Camera {camera_index} open.{api} Mode: objects. Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
-            return _loop_objects(v, cap, landmarker, detector, ObjectPointPipeline(config.stable_frames, config.min_ray_length))
+            talk = " Speaking locks; press V to talk." if voice is not None else ""
+            print(f"Camera {camera_index} open.{api} Mode: objects.{talk} Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
+            pipeline_objects = ObjectPointPipeline(config.stable_frames, config.min_ray_length)
+            return _loop_objects(v, cap, landmarker, detector, pipeline_objects, voice)
         # One pipeline (and one TemporalSmoother) for the whole session, reused every frame.
         pipeline = PointPipeline(config)
         print(f"Camera {camera_index} open.{api} Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
@@ -599,6 +631,8 @@ def run(
         print("\nStopped (Ctrl+C).")
         return EXIT_OK
     finally:
+        if voice is not None:
+            voice.close()
         if detector is not None:
             detector.close()
         if landmarker is not None:
@@ -629,7 +663,13 @@ def main(argv: list[str] | None = None) -> int:
         "--object-model", type=Path, default=DEFAULT_OBJECT_MODEL_PATH,
         help=f"EfficientDet-Lite0 .tflite for --mode objects (default: {DEFAULT_OBJECT_MODEL_PATH.relative_to(REPO_ROOT)})",
     )
+    parser.add_argument(
+        "--speak", action="store_true",
+        help="with --mode objects: say each new lock out loud, and press V to talk to MORPH (needs .env keys)",
+    )
     args = parser.parse_args(argv)
+    if args.speak and args.mode != "objects":
+        parser.error("--speak needs --mode objects")
     if args.camera < 0:
         parser.error("--camera must be >= 0")
     try:
@@ -637,7 +677,7 @@ def main(argv: list[str] | None = None) -> int:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE
-    return run(args.camera, args.model, config=config, mode=args.mode, object_model=args.object_model)
+    return run(args.camera, args.model, config=config, mode=args.mode, object_model=args.object_model, speak=args.speak)
 
 
 if __name__ == "__main__":

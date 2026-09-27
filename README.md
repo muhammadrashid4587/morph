@@ -596,6 +596,21 @@ python -m morph_pi.camera_debug --mode objects
   e.g. `CUP (0.87)`, and becomes `LOCKED: CUP (0.87)` after the same 12-frame
   rule as the colors. The lock fires once per gesture and is released when
   you point elsewhere or drop your hand.
+- **`--speak`** (objects mode): each new lock is spoken once, e.g. "That's a
+  cup." or "Locked on that." for an unrecognized object.
+  - **Talk to MORPH:** press **V** in the camera window to start and **V**
+    again to stop. MORPH transcribes you and sends the question, with the
+    locked object, to the Gemini agent. So "what am I pointing at?" or "tell me
+    about this" gets a spoken answer.
+  - **Safety rules unchanged:** the same allowlist, and dry run.
+  - **The video never waits:** speech and network calls run in the
+    background. A new lock or V press while MORPH is busy is skipped.
+  - **Audio devices:** set `MORPH_AUDIO_INPUT` / `MORPH_AUDIO_OUTPUT` in
+    `.env`.
+
+  ```bash
+  python -m morph_pi.camera_debug --mode objects --speak
+  ```
 - **Pi speed:** the detector runs on every 3rd frame, on a 320-pixel-wide copy
   of the image, and its boxes are reused in between. The hand tracker still
   runs on every frame.
