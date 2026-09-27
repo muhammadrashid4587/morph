@@ -20,6 +20,7 @@ Exit codes: 0 normal quit, 1 camera failure, 2 usage error, 3 missing setup
 from __future__ import annotations
 
 import argparse
+import importlib
 import math
 import os
 import sys
@@ -190,20 +191,84 @@ class FpsMeter:
 class Vision:
     cv2: Any
     mp: Any
-    base_options: Any  # mediapipe.tasks.python.BaseOptions
-    vision: Any  # mediapipe.tasks.python.vision
+    base_options: Any  # BaseOptions class of the resolved MediaPipe API
+    vision: Any  # namespace providing HandLandmarker, HandLandmarkerOptions, RunningMode
+    image: Any = None  # mp.Image class (None: use mp.Image)
+    image_format: Any = None  # mp.ImageFormat (None: use mp.ImageFormat)
+    api: str = ""  # which import path was used, shown at startup
+
+
+class VisionApiError(RuntimeError):
+    """MediaPipe is installed, but no complete Hand Landmarker API was found in it."""
+
+
+_LANDMARKER_ATTRS = ("HandLandmarker", "HandLandmarkerOptions", "RunningMode")
+
+
+def _complete_api(tasks: Any, vision: Any) -> tuple[Any, Any] | None:
+    """(BaseOptions, vision) when this namespace pair is a complete Hand Landmarker API.
+
+    BaseOptions is taken from the same namespace as `vision`, never mixed across builds.
+    """
+    if vision is None or not all(hasattr(vision, name) for name in _LANDMARKER_ATTRS):
+        return None
+    base_options = getattr(tasks, "BaseOptions", None) or getattr(vision, "BaseOptions", None)
+    return (base_options, vision) if base_options is not None else None
+
+
+def resolve_mediapipe_api(mp: Any, import_module: Any = importlib.import_module) -> tuple[Any, Any, str]:
+    """Find (BaseOptions, vision namespace, description) across MediaPipe builds.
+
+    1. `mediapipe.tasks.python` (+ `.vision`): the layout the Mac builds use (tried first,
+       so the known-working Mac path is unchanged).
+    2. `mp.tasks.vision` / `mp.tasks.BaseOptions`: MediaPipe 1.0.1 on the Pi, where
+       `mediapipe.tasks.python.vision` imports but has no HandLandmarker.
+    """
+    try:
+        python_api = import_module("mediapipe.tasks.python")
+        vision = getattr(python_api, "vision", None)
+        if vision is None:
+            vision = import_module("mediapipe.tasks.python.vision")
+        api = _complete_api(python_api, vision)
+        if api is not None:
+            return (*api, "mediapipe.tasks.python.vision")
+    except (ImportError, AttributeError):
+        pass
+    tasks = getattr(mp, "tasks", None)
+    api = _complete_api(tasks, getattr(tasks, "vision", None))
+    if api is not None:
+        return (*api, "mp.tasks.vision")
+    version = getattr(mp, "__version__", "unknown version")
+    raise VisionApiError(
+        f"MediaPipe {version} has no complete Hand Landmarker API: tried mediapipe.tasks.python.vision "
+        "and mp.tasks.vision (each needs HandLandmarker, HandLandmarkerOptions, RunningMode, BaseOptions)"
+    )
+
+
+def resolve_image_api(mp: Any, vision: Any) -> tuple[Any, Any]:
+    """(Image class, ImageFormat) with an SRGB format: mp.Image first, then the vision namespace."""
+    for namespace in (mp, vision):
+        image = getattr(namespace, "Image", None)
+        image_format = getattr(namespace, "ImageFormat", None)
+        if image is not None and hasattr(image_format, "SRGB"):
+            return image, image_format
+    raise VisionApiError("MediaPipe provides no Image / ImageFormat.SRGB (tried mp.Image and the vision namespace)")
 
 
 def load_vision() -> Vision | None:
-    """Import OpenCV and MediaPipe lazily. None when either is not installed."""
+    """Import OpenCV and MediaPipe lazily. None when either is not installed.
+
+    Raises VisionApiError when MediaPipe is installed but its Hand Landmarker API is not found.
+    """
     os.environ.setdefault("GLOG_minloglevel", "2")  # quieter MediaPipe native logs
     try:
         import cv2
         import mediapipe as mp
-        from mediapipe.tasks.python import BaseOptions, vision
     except ImportError:
         return None
-    return Vision(cv2, mp, BaseOptions, vision)
+    base_options, vision, api = resolve_mediapipe_api(mp)
+    image, image_format = resolve_image_api(mp, vision)
+    return Vision(cv2, mp, base_options, vision, image, image_format, api)
 
 
 def model_help(path: Path) -> str:
@@ -241,7 +306,9 @@ def create_landmarker(v: Vision, model_path: Path) -> Any:
 def detect_hand(v: Vision, landmarker: Any, frame: Any, timestamp_ms: int) -> list[tuple[float, float]] | None:
     """Raw normalized (x, y) of the first detected hand in the (unmirrored) frame."""
     rgb = v.cv2.cvtColor(frame, v.cv2.COLOR_BGR2RGB)
-    image = v.mp.Image(image_format=v.mp.ImageFormat.SRGB, data=rgb)
+    image_cls = v.image if v.image is not None else v.mp.Image
+    image_format = v.image_format if v.image_format is not None else v.mp.ImageFormat
+    image = image_cls(image_format=image_format.SRGB, data=rgb)
     result = landmarker.detect_for_video(image, timestamp_ms)
     if not result.hand_landmarks:
         return None
@@ -369,7 +436,11 @@ def run(
     vision: Vision | None = None,
     config: TargetConfig | None = None,
 ) -> int:
-    v = vision if vision is not None else load_vision()
+    try:
+        v = vision if vision is not None else load_vision()
+    except VisionApiError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_SETUP
     if v is None:
         print(MISSING_DEPS_MESSAGE, file=sys.stderr)
         return EXIT_SETUP
@@ -392,7 +463,8 @@ def run(
             return EXIT_SETUP
         # One pipeline (and one TemporalSmoother) for the whole session, reused every frame.
         pipeline = PointPipeline(config if config is not None else default_config())
-        print(f"Camera {camera_index} open. Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
+        api = f" MediaPipe {getattr(v.mp, '__version__', '?')} via {v.api}." if v.api else ""
+        print(f"Camera {camera_index} open.{api} Window: '{WINDOW_TITLE}'. Press Q or Esc to quit.")
         return _loop(v, cap, landmarker, pipeline)
     except KeyboardInterrupt:
         print("\nStopped (Ctrl+C).")
