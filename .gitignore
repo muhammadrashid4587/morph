@@ -48,3 +48,6 @@ desktop.ini
 # --- Downloaded ML model files (never committed) ---
 models/
 *.task
+
+# --- Generated speech audio (ElevenLabs cache) ---
+voice_cache/
