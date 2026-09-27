@@ -450,7 +450,7 @@ def draw_objects(cv2: Any, img: Any, frame: ObjectFrame) -> None:
         p0, p1 = _mirrored_rect(box, width, height)
         cv2.rectangle(img, p0, p1, BONE, 1, cv2.LINE_AA)
         cv2.putText(img, f"{box.label} {box.score:.2f}", (p0[0] + 3, p0[1] + 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, BONE, 1, cv2.LINE_AA)
-    if chosen is not None and frame.ray is not None:
+    if chosen is not None:  # from the ray, or from the fingertip when there is no ray
         color = GREEN if frame.locked else WHITE
         p0, p1 = _mirrored_rect(chosen, width, height)
         cv2.rectangle(img, p0, p1, color, 5 if frame.locked else 3, cv2.LINE_AA)

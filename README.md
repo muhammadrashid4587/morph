@@ -587,6 +587,11 @@ python -m morph_pi.camera_debug --mode objects
 
   Boxes that contain the pointing hand itself, such as your own `person` box,
   are ignored.
+- **No ray** (e.g. "index finger ray too short", finger curled): MORPH uses the
+  fingertip instead. It picks the smallest detected box under the fingertip,
+  otherwise the nearest box, otherwise `LOCKED: OBJECT`. Your own `person` box
+  is still ignored. The same 12-frame lock applies, and it continues if the ray
+  drops out while you stay on the same object.
 - **On screen:** every box is drawn faintly. The chosen box is bold, labeled
   e.g. `CUP (0.87)`, and becomes `LOCKED: CUP (0.87)` after the same 12-frame
   rule as the colors. The lock fires once per gesture and is released when

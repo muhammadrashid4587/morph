@@ -20,6 +20,7 @@ from morph_pi.objects import (
     boxes_from_detections,
     ray_entry,
     region_box,
+    select_at_fingertip,
     select_box,
 )
 
@@ -162,7 +163,10 @@ def test_pipeline_region_lock_and_release() -> None:
     assert frames[-1].label == "LOCKED: OBJECT"
     gone = pipeline.process(None, [])
     assert gone.status == "NO HAND" and gone.streak == 0
-    assert pipeline.process([(0.5, 0.9)] * 21, []).status == "NO RAY"  # landmarks 5 and 8 overlap
+    assert pipeline.process([(0.5, 0.9)] * 20, []).status == "NO RAY"  # unusable landmarks: nothing to fall back to
+    off_frame = [(0.5, 0.9)] * 21
+    off_frame[8] = (1.3, 0.9)
+    assert pipeline.process(off_frame, []).status == "NO RAY"
 
 
 # --- objects-mode viewer loop (fakes) --------------------------------------------------------------------
@@ -248,3 +252,60 @@ def test_objects_mode_explains_a_missing_model(tmp_path: Path, capsys: pytest.Ca
     assert code == camera_debug.EXIT_SETUP
     err = capsys.readouterr().err
     assert "Object detection model not found" in err and camera_debug.OBJECT_MODEL_URL in err
+
+
+# --- no ray: fingertip fallback ----------------------------------------------------------------------------
+
+TIP, KNUCKLE = Point2D(0.5, 0.5), Point2D(0.5, 0.505)  # index finger curled: ray too short
+
+
+def test_fingertip_fallback_picks_the_smallest_box_under_the_tip() -> None:
+    cup, table = box(0.45, 0.45, 0.55, 0.502, "cup"), box(0.1, 0.4, 0.9, 0.52, "table")
+    # both contain the fingertip (and the table the knuckle too): the smallest, most specific box wins
+    choice = select_at_fingertip(TIP, KNUCKLE, [table, cup])
+    assert (choice.box, choice.how) == (cup, "fingertip")
+    small, big = box(0.48, 0.48, 0.52, 0.502, "key"), box(0.4, 0.4, 0.6, 0.502, "book")
+    assert select_at_fingertip(TIP, KNUCKLE, [big, small]).box == small
+
+
+def test_fingertip_fallback_nearest_then_region_and_ignores_the_hand() -> None:
+    person = box(0.0, 0.3, 1.0, 1.0, "person", 0.99)  # contains the knuckle
+    near = box(0.56, 0.4, 0.7, 0.48, "mouse")          # ~0.06 from the tip
+    held = box(0.45, 0.45, 0.55, 0.51, "cup")          # contains the knuckle too, but is not a person: kept
+    assert select_at_fingertip(TIP, KNUCKLE, [person, held]).box == held
+    assert select_at_fingertip(TIP, KNUCKLE, [person, near]).how == "nearest"
+    alone = select_at_fingertip(TIP, KNUCKLE, [person])
+    assert (alone.how, alone.name) == ("region", REGION_NAME)
+
+
+def test_no_ray_locks_on_the_box_under_the_fingertip_with_the_same_12_frame_rule() -> None:
+    curled = [(0.5, 0.505)] * 21
+    curled[8] = (0.5, 0.5)  # landmarks 5 and 8 almost overlap -> "index finger ray too short"
+    cup = box(0.45, 0.45, 0.55, 0.502, "cup", 0.91)
+    person = box(0.0, 0.3, 1.0, 1.0, "person", 0.99)
+    pipeline = ObjectPointPipeline(stable_frames=12)
+    frames = [pipeline.process(curled, [person, cup]) for _ in range(13)]
+    assert all(f.ray is None for f in frames)
+    assert frames[0].status == "CANDIDATE" and frames[0].label == "CUP (0.91)"
+    assert [f.just_locked for f in frames].index(True) == 11 and sum(f.just_locked for f in frames) == 1
+    assert frames[11].label == "LOCKED: CUP (0.91)"
+    assert frames[12].summary() == "state=CANDIDATE target=CUP confidence=0.91 frames=12/12 via fingertip (no ray: fingertip) (locked)"
+
+
+def test_no_ray_with_nothing_there_locks_the_region() -> None:
+    curled = [(0.5, 0.505)] * 21
+    curled[8] = (0.5, 0.5)
+    pipeline = ObjectPointPipeline(stable_frames=3)
+    frames = [pipeline.process(curled, [box(0.0, 0.3, 1.0, 1.0, "person")]) for _ in range(3)]
+    assert frames[-1].label == "LOCKED: OBJECT"
+
+
+def test_lock_continues_when_the_ray_drops_out_on_the_same_object() -> None:
+    pipeline = ObjectPointPipeline(stable_frames=12)
+    cup = box(0.4, 0.5, 0.6, 0.6, "cup", 0.87)
+    for _ in range(6):
+        pipeline.process(hand(UP), [cup])      # ray hits the cup
+    curled = [(0.5, 0.56)] * 21
+    curled[8] = (0.5, 0.555)                   # finger curls onto the cup: no ray
+    frames = [pipeline.process(curled, [cup]) for _ in range(6)]
+    assert frames[-1].just_locked and frames[-1].streak == 12  # 6 + 6: the streak was not reset

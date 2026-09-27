@@ -5,6 +5,8 @@ Selection, in order:
               the fingertip is always hit, because the ray passes through the fingertip.
 2. "nearest": otherwise the box nearest the fingertip, within NEAREST_MAX (normalized units).
 3. "region":  nothing detected there -> a fixed region under the fingertip, named OBJECT.
+No usable ray (e.g. index finger ray too short) -> select_at_fingertip(): the box under the
+fingertip ("fingertip"), else the nearest one, else the region. The same lock applies.
 Boxes containing the pointing hand's own knuckle (landmark 5) are skipped: that is the
 person/hand doing the pointing, not the target.
 
@@ -20,9 +22,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from .config import DEFAULT_MIN_RAY_LENGTH, DEFAULT_STABLE_FRAMES
+from .config import DEFAULT_MIN_RAY_LENGTH, DEFAULT_STABLE_FRAMES, INDEX_FINGER_MCP, INDEX_FINGER_TIP
 from .geometry import direction
-from .hand_tracking import ray_from_landmarks
+from .hand_tracking import HAND_LANDMARK_COUNT, landmarks_to_points, ray_from_landmarks
 from .models import Point2D, Ray2D
 
 NEAREST_MAX = 0.15   # a box farther than this from the fingertip is not "near"
@@ -55,7 +57,7 @@ class Box:
 @dataclass(frozen=True, slots=True)
 class Choice:
     box: Box
-    how: str  # "ray", "nearest" or "region"
+    how: str  # "ray", "fingertip", "nearest" or "region"
 
     @property
     def name(self) -> str:
@@ -93,11 +95,27 @@ def region_box(tip: Point2D) -> Box:
 
 def select_box(ray: Ray2D, boxes: Sequence[Box]) -> Choice:
     """The box the user points at (see module doc for the order). Never None."""
-    tip = ray.through
     candidates = [b for b in boxes if not b.contains(ray.origin)]  # skip the pointing hand/person
     hits = [(t, b) for b in candidates if (t := ray_entry(ray, b)) is not None]
     if hits:
         return Choice(min(hits, key=lambda h: (h[0], -h[1].score))[1], "ray")
+    return _nearest_or_region(ray.through, candidates)
+
+
+def select_at_fingertip(tip: Point2D, knuckle: Point2D, boxes: Sequence[Box]) -> Choice:
+    """No usable ray: the box under the fingertip (smallest), else the nearest one, else the region.
+
+    A "person" box containing the knuckle (landmark 5) is the pointing hand's owner and is skipped.
+    Other boxes under the hand stay: a curled finger often rests on the very object it means.
+    """
+    candidates = [b for b in boxes if not (b.label.lower() == "person" and b.contains(knuckle))]
+    under = [b for b in candidates if b.contains(tip)]
+    if under:
+        return Choice(min(under, key=lambda b: (b.area, -b.score)), "fingertip")
+    return _nearest_or_region(tip, candidates)
+
+
+def _nearest_or_region(tip: Point2D, candidates: Sequence[Box]) -> Choice:
     near = [(b.distance_to(tip), b) for b in candidates]
     near = [n for n in near if n[0] <= NEAREST_MAX]
     if near:
@@ -176,8 +194,8 @@ class ObjectFrame:
     def status(self) -> str:
         if not self.hand_detected:
             return "NO HAND"
-        if self.ray is None:
-            return "NO RAY"
+        if self.choice is None:
+            return "NO RAY"  # landmarks unusable: no ray and no fingertip
         return "LOCKED" if self.locked else "CANDIDATE"
 
     @property
@@ -197,9 +215,10 @@ class ObjectFrame:
         line = f"state={state} target={target} confidence={conf:.2f} frames={min(self.streak, self.stable_frames)}/{self.stable_frames}{how}"
         if not self.hand_detected:
             return line + " (no hand)"
-        if self.ray is None:
+        if self.choice is None:
             return line + " (no ray)"
-        return line + (" (locked)" if self.locked and not self.just_locked else "")
+        no_ray = " (no ray: fingertip)" if self.ray is None else ""
+        return line + no_ray + (" (locked)" if self.locked and not self.just_locked else "")
 
 
 class ObjectPointPipeline:
@@ -216,8 +235,13 @@ class ObjectPointPipeline:
             return self._frame(False, None, None, boxes, False)
         ray = ray_from_landmarks(landmarks, self.min_ray_length)
         if ray is None:
-            self.lock.reset()
-            return self._frame(True, None, None, boxes, False)
+            try:  # e.g. "index finger ray too short": fall back to the fingertip
+                points = landmarks_to_points(landmarks[:HAND_LANDMARK_COUNT])
+            except ValueError:  # too few / off-frame / non-numeric landmarks: nothing usable
+                self.lock.reset()
+                return self._frame(True, None, None, boxes, False)
+            choice = select_at_fingertip(points[INDEX_FINGER_TIP], points[INDEX_FINGER_MCP], boxes)
+            return self._frame(True, None, choice, boxes, self.lock.update(choice.name))
         choice = select_box(ray, boxes)
         just = self.lock.update(choice.name)
         return self._frame(True, ray, choice, boxes, just)
