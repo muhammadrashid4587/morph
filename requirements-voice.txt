@@ -1,6 +1,5 @@
-# Optional: MORPH voice + Claude agent (morph_voice, morph_agent). Not needed for tests.
+# Optional: MORPH voice + Gemini agent (morph_voice, morph_agent). Not needed for tests.
 #   pip install -r requirements-voice.txt
 # Raspberry Pi: first install the PortAudio library that sounddevice needs:
 #   sudo apt install libportaudio2
-anthropic>=1,<2
 sounddevice>=0.4.6

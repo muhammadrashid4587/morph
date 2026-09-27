@@ -37,6 +37,7 @@ PHRASES: tuple[str, ...] = (
     "Cancelled.",
     "Sorry, I didn't catch that.",
     "Sorry, I can't do that.",
+    "Give me a second.",
 )
 
 

@@ -561,27 +561,42 @@ and green `x` values in a `--config` file.
 This is still visualization only: nothing is sent over serial or WebSocket,
 and no hardware moves.
 
-## Voice and Claude agent (`morph_voice`, `morph_agent`)
+## Voice and Gemini agent (`morph_voice`, `morph_agent`)
 
 MORPH can listen and talk. Press Enter and speak; MORPH transcribes you with
-ElevenLabs speech-to-text. Claude then picks **one** action from a fixed
-allowlist: `set_mode`, `next_slide`, `prev_slide`, `volume_up`, `volume_down`,
-`say` or `none`. MORPH answers out loud with ElevenLabs text-to-speech.
+ElevenLabs speech-to-text. A Gemini Flash model (free tier) then picks **one**
+action from a fixed allowlist: `set_mode`, `next_slide`, `prev_slide`,
+`volume_up`, `volume_down`, `say` or `none`. MORPH answers out loud with
+ElevenLabs text-to-speech.
 
-- **Claude can't reach hardware.** There is no action for servos, the arm, the
-  Nano or shell commands. Claude's answer is validated in code, and anything
-  outside the allowlist becomes `none`.
+- **The model can't reach hardware.** There is no action for servos, the arm,
+  the Nano or shell commands. Gemini must answer with JSON only (a response
+  schema). The answer is validated in code, and anything invalid becomes `none`.
+- **Free-tier rate limit** (HTTP 429): MORPH says "Give me a second." and does
+  nothing.
+- **No `GEMINI_API_KEY`, or the API fails:** a keyword fallback decides.
+
+  | You say | Action |
+  |---|---|
+  | next / forward | next slide |
+  | back / previous | previous slide |
+  | louder / volume up | volume up |
+  | quieter / softer / volume down | volume down |
+  | presentation / music / targeting | switch to that mode |
+
+  If more than one of these is heard in one command, MORPH does nothing.
 - **Dry run is the default.** The chosen action is printed, not sent. `--live`
   sends it to the laptop agent (`morph_desktop`).
-- **Keys come from `.env` only** (git-ignored) and are never printed.
+- **Keys come from `.env` only** (git-ignored). The Gemini key is sent in a
+  request header, never in a URL, and is never printed.
 
 | `.env` key | Required? | What it's for |
 |---|---|---|
 | `ELEVENLABS_API_KEY` | yes | Speech in and out |
-| `ANTHROPIC_API_KEY` | yes | The agent |
+| `GEMINI_API_KEY` | optional | The agent (without it: keyword commands only) |
+| `MORPH_AGENT_MODEL` | optional | Default `gemini-3.8-flash`; any Gemini model id with free-tier access works, e.g. a Flash-Lite model for higher free limits |
 | `ELEVENLABS_VOICE_ID` | optional | Pin a voice (otherwise the first premade voice) |
 | `MORPH_AUDIO_INPUT`, `MORPH_AUDIO_OUTPUT` | optional | Device number or name from `--devices` |
-| `MORPH_AGENT_MODEL` | optional | Default `claude-opus-5` |
 | `MORPH_LAPTOP_URL`, `MORPH_AUTH_TOKEN` | optional | For `--live` |
 
 ```bash
@@ -589,6 +604,7 @@ pip install -r requirements-voice.txt       # Raspberry Pi: first `sudo apt inst
 python -m morph_voice --devices             # list mics and speakers
 python -m morph_voice --cache-phrases       # pre-generate the fixed phrases (fast demo, works offline after)
 python -m morph_agent.demo                  # press Enter, speak, press Enter; MORPH replies (dry run)
+python -m morph_agent.demo --type           # type commands instead of speaking
 python -m morph_agent.demo --mode presentation --target blue --live
 ```
 

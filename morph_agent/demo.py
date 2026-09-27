@@ -5,7 +5,7 @@
     python -m morph_agent.demo --live               also send the action to the laptop agent
     python -m morph_agent.demo --type               type instead of speaking (no microphone)
 
-Needs ELEVENLABS_API_KEY and ANTHROPIC_API_KEY in .env. Ctrl+C to quit.
+Needs ELEVENLABS_API_KEY in .env; GEMINI_API_KEY is optional (keyword commands without it). Ctrl+C to quit.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ from morph_voice.elevenlabs import ElevenLabsError
 from morph_voice.env import MissingKeyError
 
 from .actions import MODES, TARGETS, MorphState, apply
-from .agent import Agent, AgentError
+from .agent import Agent
 from .executor import DryRunExecutor, LaptopExecutor
 
 
@@ -32,10 +32,15 @@ def run_turn(
     say: Callable[[str], None],
     out: Callable[[str], None] = print,
 ) -> MorphState:
-    """One exchange: listen -> Claude picks an action -> execute (or dry run) -> speak the reply."""
+    """One exchange: listen -> the agent picks an action -> execute (or dry run) -> speak the reply."""
     transcript = listen()
     out(f"You said: {transcript!r}")
     action = agent.decide(transcript, state)
+    source = getattr(agent, "last_source", "gemini")
+    if source == "keywords":
+        out(f"(keyword fallback{': ' + agent.last_error if agent.last_error else ''})")
+    elif source == "rate_limited":
+        out(f"({agent.last_error})")
     out(f"MORPH action: {action.action}" + (f" (mode={action.mode})" if action.mode else "") + f" | reply: {action.reply!r}")
     executor.execute(action)
     say(action.reply)
@@ -54,10 +59,10 @@ def main(argv: list[str] | None = None) -> int:
 
     state = MorphState(args.mode, args.target)
     executor = LaptopExecutor() if args.live else DryRunExecutor()
+    agent = Agent.from_env()
     try:
-        agent = Agent.from_env()
         voice = speech.default_voice()
-    except (MissingKeyError, AgentError, ElevenLabsError) as exc:
+    except (MissingKeyError, ElevenLabsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     listen = (lambda: input("You (type): ")) if args.type else voice.listen
@@ -68,7 +73,7 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("\nBye.")
             return 0
-        except (AgentError, ElevenLabsError, AudioUnavailable, ValueError, OSError) as exc:
+        except (ElevenLabsError, AudioUnavailable, ValueError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             if isinstance(exc, AudioUnavailable):
                 return 1
