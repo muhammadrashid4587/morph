@@ -612,6 +612,42 @@ Spoken audio is cached in `voice_cache/` (git-ignored), so a repeated phrase
 plays without the network. The tests need no network, microphone, keys or
 audio packages.
 
+## Raspberry Pi setup
+
+Raspberry Pi 4 with Python 3.11 in `.venv311`, created with
+[uv](https://docs.astral.sh/uv/). MediaPipe 1.x crashes on the Pi 4, so the Pi
+uses **`mediapipe==0.10.18`**.
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh     # install uv (once)
+sudo apt install libportaudio2                       # audio library needed by the voice
+uv venv --python 3.11 .venv311
+uv pip install --python .venv311/bin/python -r requirements.txt -r requirements-voice.txt "mediapipe==0.10.18"
+```
+
+Install MediaPipe with that exact version. `morph_pi/requirements-vision.txt`
+pins the Mac's version (`>=0.10.21,<1.0`) and would replace 0.10.18.
+
+**Camera.** Download the hand model once (see "Live Camera Debug"), then:
+
+```bash
+.venv311/bin/python -m morph_pi.camera_debug
+```
+
+**Voice.** Find the USB mic and the speaker, then put their numbers or names in
+`.env`:
+
+```bash
+.venv311/bin/python -m morph_voice --devices
+```
+
+```
+MORPH_AUDIO_INPUT=<USB mic number or name>
+MORPH_AUDIO_OUTPUT=<speaker number or name>
+```
+
+Then run `.venv311/bin/python -m morph_agent.demo`.
+
 ## Scope
 
 In scope today:
